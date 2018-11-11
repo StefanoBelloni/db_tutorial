@@ -1,3 +1,17 @@
+/**
+ * @File Implementatzion of a minimal SQsuperLite
+ *
+ *
+ * A node has the following seriablization:
+ * [id][username       ][email ...  ]
+ * 0   4                36          291
+ *  
+ * */
+
+
+#include <stdint.h>   /* defines uint_<N>_t */
+
+#include <sys/stat.h> /* defines S_IWUSR */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -6,6 +20,95 @@
 #include <string.h>
 #include <unistd.h>
 
+/* ========================================================================== */
+/*                       MACROS AND DEFINES                                   */
+/* ========================================================================== */
+
+#define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
+
+#define COLUMN_USERNAME_SIZE             32
+#define COLUMN_EMAIL_SIZE                255
+
+#define ID_SIZE                          size_of_attribute(Row, id)
+#define USERNAME_SIZE                    size_of_attribute(Row, username)
+#define EMAIL_SIZE                       size_of_attribute(Row, email)
+#define ID_OFFSET                        0
+#define USERNAME_OFFSET                  ID_OFFSET + ID_SIZE
+#define EMAIL_OFFSET                     USERNAME_OFFSET + USERNAME_SIZE
+#define ROW_SIZE                         ID_SIZE + USERNAME_SIZE + EMAIL_SIZE
+
+#define PAGE_SIZE                        4096
+#define TABLE_MAX_PAGES                  100
+
+/*
+ * Common Node Header Layout
+ */
+#define NODE_TYPE_SIZE                   sizeof( uint8_t )
+#define NODE_TYPE_OFFSET                 0
+#define IS_ROOT_SIZE                     sizeof( uint8_t  )
+#define IS_ROOT_OFFSET                   NODE_TYPE_SIZE
+#define PARENT_POINTER_SIZE              sizeof( uint32_t )
+#define PARENT_POINTER_OFFSET            IS_ROOT_OFFSET + IS_ROOT_SIZE
+#define COMMON_NODE_HEADER_SIZE          NODE_TYPE_SIZE + IS_ROOT_SIZE +       \
+                                            PARENT_POINTER_SIZE
+
+/*
+ * Internal Node Header Layout
+ */
+#define INTERNAL_NODE_NUM_KEYS_SIZE      sizeof( uint32_t )
+#define INTERNAL_NODE_NUM_KEYS_OFFSET    COMMON_NODE_HEADER_SIZE
+#define INTERNAL_NODE_RIGHT_CHILD_SIZE   sizeof( uint32_t )
+#define INTERNAL_NODE_RIGHT_CHILD_OFFSET INTERNAL_NODE_NUM_KEYS_OFFSET +       \
+                                         INTERNAL_NODE_NUM_KEYS_SIZE
+#define INTERNAL_NODE_HEADER_SIZE        COMMON_NODE_HEADER_SIZE +             \
+                                            INTERNAL_NODE_NUM_KEYS_SIZE +      \
+                                            INTERNAL_NODE_RIGHT_CHILD_SIZE
+
+/*
+ * Internal Node Body Layout
+ */
+#define INTERNAL_NODE_KEY_SIZE           sizeof( uint32_t )
+#define INTERNAL_NODE_CHILD_SIZE         sizeof( uint32_t )
+#define INTERNAL_NODE_CELL_SIZE          INTERNAL_NODE_CHILD_SIZE +            \
+                                            INTERNAL_NODE_KEY_SIZE
+/* Keep this small for testing */
+#define INTERNAL_NODE_MAX_CELLS          3
+
+/*
+ * Leaf Node Header Layout
+ */
+#define LEAF_NODE_NUM_CELLS_SIZE         sizeof( uint32_t )
+#define LEAF_NODE_NUM_CELLS_OFFSET       COMMON_NODE_HEADER_SIZE
+#define LEAF_NODE_NEXT_LEAF_SIZE         sizeof( uint32_t )
+#define LEAF_NODE_NEXT_LEAF_OFFSET       LEAF_NODE_NUM_CELLS_OFFSET +          \
+                                            LEAF_NODE_NUM_CELLS_SIZE
+#define LEAF_NODE_HEADER_SIZE            COMMON_NODE_HEADER_SIZE +             \
+                                            LEAF_NODE_NUM_CELLS_SIZE +         \
+                                            LEAF_NODE_NEXT_LEAF_SIZE
+
+/*
+ * Leaf Node Body Layout
+ */
+#define LEAF_NODE_KEY_SIZE               sizeof( uint32_t )
+#define LEAF_NODE_KEY_OFFSET             0
+#define LEAF_NODE_VALUE_SIZE             ROW_SIZE
+#define LEAF_NODE_VALUE_OFFSET           LEAF_NODE_KEY_OFFSET +                \
+                                            LEAF_NODE_KEY_SIZE
+#define LEAF_NODE_CELL_SIZE              LEAF_NODE_KEY_SIZE +                  \
+                                            LEAF_NODE_VALUE_SIZE
+#define LEAF_NODE_SPACE_FOR_CELLS        PAGE_SIZE - LEAF_NODE_HEADER_SIZE
+#define LEAF_NODE_MAX_CELLS              LEAF_NODE_SPACE_FOR_CELLS /           \
+                                            LEAF_NODE_CELL_SIZE
+#define LEAF_NODE_RIGHT_SPLIT_COUNT     (LEAF_NODE_MAX_CELLS + 1) / 2
+#define LEAF_NODE_LEFT_SPLIT_COUNT      (LEAF_NODE_MAX_CELLS + 1) -            \
+                                            LEAF_NODE_RIGHT_SPLIT_COUNT
+
+
+/* ========================================================================== */
+/*                       STRUCURES AND ENUMS                                  */
+/* ========================================================================== */
+
+/* ************************************* */
 struct InputBuffer_t {
   char* buffer;
   size_t buffer_length;
@@ -13,6 +116,7 @@ struct InputBuffer_t {
 };
 typedef struct InputBuffer_t InputBuffer;
 
+/* ************************************* */
 enum ExecuteResult_t {
   EXECUTE_SUCCESS,
   EXECUTE_DUPLICATE_KEY,
@@ -20,12 +124,14 @@ enum ExecuteResult_t {
 };
 typedef enum ExecuteResult_t ExecuteResult;
 
+/* ************************************* */
 enum MetaCommandResult_t {
   META_COMMAND_SUCCESS,
   META_COMMAND_UNRECOGNIZED_COMMAND
 };
 typedef enum MetaCommandResult_t MetaCommandResult;
 
+/* ************************************* */
 enum PrepareResult_t {
   PREPARE_SUCCESS,
   PREPARE_NEGATIVE_ID,
@@ -35,11 +141,11 @@ enum PrepareResult_t {
 };
 typedef enum PrepareResult_t PrepareResult;
 
+/* ************************************* */
 enum StatementType_t { STATEMENT_INSERT, STATEMENT_SELECT };
 typedef enum StatementType_t StatementType;
 
-const uint32_t COLUMN_USERNAME_SIZE = 32;
-const uint32_t COLUMN_EMAIL_SIZE = 255;
+/* ************************************* */
 struct Row_t {
   uint32_t id;
   char username[COLUMN_USERNAME_SIZE + 1];
@@ -47,25 +153,19 @@ struct Row_t {
 };
 typedef struct Row_t Row;
 
+/* ************************************* */
 struct Statement_t {
   StatementType type;
   Row row_to_insert;  // only used by insert statement
 };
 typedef struct Statement_t Statement;
 
-#define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
 
-const uint32_t ID_SIZE = size_of_attribute(Row, id);
-const uint32_t USERNAME_SIZE = size_of_attribute(Row, username);
-const uint32_t EMAIL_SIZE = size_of_attribute(Row, email);
-const uint32_t ID_OFFSET = 0;
-const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
-const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
-const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+/* ************************************* */
+enum NodeType_t { NODE_INTERNAL, NODE_LEAF };
+typedef enum NodeType_t NodeType;
 
-const uint32_t PAGE_SIZE = 4096;
-const uint32_t TABLE_MAX_PAGES = 100;
-
+/* ************************************* */
 struct Pager_t {
   int file_descriptor;
   uint32_t file_length;
@@ -74,12 +174,14 @@ struct Pager_t {
 };
 typedef struct Pager_t Pager;
 
+/* ************************************* */
 struct Table_t {
   Pager* pager;
   uint32_t root_page_num;
 };
 typedef struct Table_t Table;
 
+/* ************************************* */
 struct Cursor_t {
   Table* table;
   uint32_t page_num;
@@ -88,85 +190,46 @@ struct Cursor_t {
 };
 typedef struct Cursor_t Cursor;
 
+/* ========================================================================== */
+/*                               FUNCTIONS                                    */
+/* ========================================================================== */
+
+/**
+ * print a single row of a table.
+ * */
 void print_row(Row* row) {
   printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
-enum NodeType_t { NODE_INTERNAL, NODE_LEAF };
-typedef enum NodeType_t NodeType;
+/* = === = ==== = === = === = === = === = === = === = === = === = === = === = */
 
-/*
- * Common Node Header Layout
- */
-const uint32_t NODE_TYPE_SIZE = sizeof(uint8_t);
-const uint32_t NODE_TYPE_OFFSET = 0;
-const uint32_t IS_ROOT_SIZE = sizeof(uint8_t);
-const uint32_t IS_ROOT_OFFSET = NODE_TYPE_SIZE;
-const uint32_t PARENT_POINTER_SIZE = sizeof(uint32_t);
-const uint32_t PARENT_POINTER_OFFSET = IS_ROOT_OFFSET + IS_ROOT_SIZE;
-const uint8_t COMMON_NODE_HEADER_SIZE =
-    NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
-
-/*
- * Internal Node Header Layout
- */
-const uint32_t INTERNAL_NODE_NUM_KEYS_SIZE = sizeof(uint32_t);
-const uint32_t INTERNAL_NODE_NUM_KEYS_OFFSET = COMMON_NODE_HEADER_SIZE;
-const uint32_t INTERNAL_NODE_RIGHT_CHILD_SIZE = sizeof(uint32_t);
-const uint32_t INTERNAL_NODE_RIGHT_CHILD_OFFSET =
-    INTERNAL_NODE_NUM_KEYS_OFFSET + INTERNAL_NODE_NUM_KEYS_SIZE;
-const uint32_t INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE +
-                                           INTERNAL_NODE_NUM_KEYS_SIZE +
-                                           INTERNAL_NODE_RIGHT_CHILD_SIZE;
-
-/*
- * Internal Node Body Layout
- */
-const uint32_t INTERNAL_NODE_KEY_SIZE = sizeof(uint32_t);
-const uint32_t INTERNAL_NODE_CHILD_SIZE = sizeof(uint32_t);
-const uint32_t INTERNAL_NODE_CELL_SIZE =
-    INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE;
-/* Keep this small for testing */
-const uint32_t INTERNAL_NODE_MAX_CELLS = 3;
-
-/*
- * Leaf Node Header Layout
- */
-const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
-const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
-const uint32_t LEAF_NODE_NEXT_LEAF_SIZE = sizeof(uint32_t);
-const uint32_t LEAF_NODE_NEXT_LEAF_OFFSET =
-    LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
-const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE +
-                                       LEAF_NODE_NUM_CELLS_SIZE +
-                                       LEAF_NODE_NEXT_LEAF_SIZE;
-
-/*
- * Leaf Node Body Layout
- */
-const uint32_t LEAF_NODE_KEY_SIZE = sizeof(uint32_t);
-const uint32_t LEAF_NODE_KEY_OFFSET = 0;
-const uint32_t LEAF_NODE_VALUE_SIZE = ROW_SIZE;
-const uint32_t LEAF_NODE_VALUE_OFFSET =
-    LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
-const uint32_t LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
-const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
-const uint32_t LEAF_NODE_MAX_CELLS =
-    LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
-const uint32_t LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2;
-const uint32_t LEAF_NODE_LEFT_SPLIT_COUNT =
-    (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT;
-
+/**
+ * Getter of the type of node.
+ * It will interpret the first 8 byte as the node type enum.
+ * @return the type of a node:
+ * */
 NodeType get_node_type(void* node) {
   uint8_t value = *((uint8_t*)(node + NODE_TYPE_OFFSET));
   return (NodeType)value;
 }
 
+/* = === = ==== = === = === = === = === = === = === = === = === = === = === = */
+
+/**
+ * Setter of the type of a node.
+ * It find the position where the node type is, and writes there the
+ * corresponding value as uint_8.
+ * @return this function does not return a value.
+ * */
 void set_node_type(void* node, NodeType type) {
   uint8_t value = type;
   *((uint8_t*)(node + NODE_TYPE_OFFSET)) = value;
 }
 
+/**
+ * Check if given node is the root. It position is after the node-type
+ * @return true if the node is the root.
+ * */
 bool is_node_root(void* node) {
   uint8_t value = *((uint8_t*)(node + IS_ROOT_OFFSET));
   return (bool)value;
@@ -177,7 +240,9 @@ void set_node_root(void* node, bool is_root) {
   *((uint8_t*)(node + IS_ROOT_OFFSET)) = value;
 }
 
-uint32_t* node_parent(void* node) { return node + PARENT_POINTER_OFFSET; }
+uint32_t* node_parent(void* node) {
+  return node + PARENT_POINTER_OFFSET;
+}
 
 uint32_t* internal_node_num_keys(void* node) {
   return node + INTERNAL_NODE_NUM_KEYS_OFFSET;
@@ -237,12 +302,12 @@ uint32_t get_node_max_key(void* node) {
 }
 
 void print_constants() {
-  printf("ROW_SIZE: %d\n", ROW_SIZE);
-  printf("COMMON_NODE_HEADER_SIZE: %d\n", COMMON_NODE_HEADER_SIZE);
-  printf("LEAF_NODE_HEADER_SIZE: %d\n", LEAF_NODE_HEADER_SIZE);
-  printf("LEAF_NODE_CELL_SIZE: %d\n", LEAF_NODE_CELL_SIZE);
-  printf("LEAF_NODE_SPACE_FOR_CELLS: %d\n", LEAF_NODE_SPACE_FOR_CELLS);
-  printf("LEAF_NODE_MAX_CELLS: %d\n", LEAF_NODE_MAX_CELLS);
+  printf("  ROW_SIZE:                  %d\n", ROW_SIZE);
+  printf("  COMMON_NODE_HEADER_SIZE:   %d\n", COMMON_NODE_HEADER_SIZE);
+  printf("  LEAF_NODE_HEADER_SIZE:     %d\n", LEAF_NODE_HEADER_SIZE);
+  printf("  LEAF_NODE_CELL_SIZE:       %d\n", LEAF_NODE_CELL_SIZE);
+  printf("  LEAF_NODE_SPACE_FOR_CELLS: %d\n", LEAF_NODE_SPACE_FOR_CELLS);
+  printf("  LEAF_NODE_MAX_CELLS:       %d\n", LEAF_NODE_MAX_CELLS);
 }
 
 void* get_page(Pager* pager, uint32_t page_num) {
@@ -319,15 +384,15 @@ void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
 }
 
 void serialize_row(Row* source, void* destination) {
-  memcpy(destination + ID_OFFSET, &(source->id), ID_SIZE);
+  memcpy(destination + ID_OFFSET,       &(source->id),       ID_SIZE);
   memcpy(destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
-  memcpy(destination + EMAIL_OFFSET, &(source->email), EMAIL_SIZE);
+  memcpy(destination + EMAIL_OFFSET,    &(source->email),    EMAIL_SIZE);
 }
 
 void deserialize_row(void* source, Row* destination) {
-  memcpy(&(destination->id), source + ID_OFFSET, ID_SIZE);
+  memcpy(&(destination->id),       source + ID_OFFSET,       ID_SIZE);
   memcpy(&(destination->username), source + USERNAME_OFFSET, USERNAME_SIZE);
-  memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
+  memcpy(&(destination->email),    source + EMAIL_OFFSET,    EMAIL_SIZE);
 }
 
 void initialize_leaf_node(void* node) {
@@ -585,6 +650,18 @@ void db_close(Table* table) {
   free(pager);
 }
 
+void print_commands_help() {
+  printf(" commands: \n");
+  printf("    insert <id> <name> <email> .. insert the element in the db\n");
+  printf("    select ...................... select all from the table\n");
+  printf(" meta-commands: \n");
+  printf("    .btree ...................... print the b-tree\n");
+  printf("    .constants .................. print the constants of interests\n");
+  printf("    .help ....................... print this help\n");
+  printf("    .exit ....................... quit\n");
+}
+
+
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
   if (strcmp(input_buffer->buffer, ".exit") == 0) {
     db_close(table);
@@ -597,6 +674,9 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
     printf("Constants:\n");
     print_constants();
     return META_COMMAND_SUCCESS;
+  } else if (strcmp(input_buffer->buffer, ".help") == 0) {
+    print_commands_help();
+    return META_COMMAND_SUCCESS;
   } else {
     return META_COMMAND_UNRECOGNIZED_COMMAND;
   }
@@ -605,12 +685,15 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
 PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
   statement->type = STATEMENT_INSERT;
 
-  char* keyword = strtok(input_buffer->buffer, " ");
+  /* char* keyword =*/
+                    strtok(input_buffer->buffer, " ");
   char* id_string = strtok(NULL, " ");
-  char* username = strtok(NULL, " ");
-  char* email = strtok(NULL, " ");
+  char* username  = strtok(NULL, " ");
+  char* email     = strtok(NULL, " ");
 
-  if (id_string == NULL || username == NULL || email == NULL) {
+  if (     id_string == NULL
+        || username  == NULL
+        || email     == NULL    ) {
     return PREPARE_SYNTAX_ERROR;
   }
 
@@ -854,6 +937,16 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
   }
 }
 
+/**
+ * ************************************************************************** *
+ *                    #    #    ##       #    #    #                          *
+ *                    ##  ##   #  #      #    ##   #                          *
+ *                    # ## #  #    #     #    # #  #                          *
+ *                    #    #  ######     #    #  # #                          *
+ *                    #    #  #    #     #    #   ##                          *
+ *                    #    #  #    #     #    #    #                          *
+* *************************************************************************** */
+
 int main(int argc, char* argv[]) {
   if (argc < 2) {
     printf("Must supply a database filename.\n");
@@ -864,11 +957,14 @@ int main(int argc, char* argv[]) {
   Table* table = db_open(filename);
 
   InputBuffer* input_buffer = new_input_buffer();
+
+  /* *********************************** */
   while (true) {
     print_prompt();
     read_input(input_buffer);
 
-    if (input_buffer->buffer[0] == '.') {
+    /* *********************************** */
+  if (input_buffer->buffer[0] == '.') {
       switch (do_meta_command(input_buffer, table)) {
         case (META_COMMAND_SUCCESS):
           continue;
@@ -878,6 +974,7 @@ int main(int argc, char* argv[]) {
       }
     }
 
+  /* *********************************** */
     Statement statement;
     switch (prepare_statement(input_buffer, &statement)) {
       case (PREPARE_SUCCESS):
@@ -897,6 +994,7 @@ int main(int argc, char* argv[]) {
         continue;
     }
 
+    /* *********************************** */
     switch (execute_statement(&statement, table)) {
       case (EXECUTE_SUCCESS):
         printf("Executed.\n");

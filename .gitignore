@@ -2,3 +2,11 @@ db
 *.db
 _site/
 TODO
+bin/
+build/
+res/
+
+GPATH
+GRTAGS
+GTAGS
+
